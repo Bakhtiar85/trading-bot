@@ -2,6 +2,7 @@ import { GridBot } from './bot';
 import { ConfigError, loadConfig } from './config';
 import { Exchange } from './exchange';
 import { configureLogger, errorMessage, logger } from './logger';
+import { startHealthServer } from './health';
 import { createMailer, Notifier } from './notifications';
 import { StateStore } from './risk';
 import type { Config } from './types';
@@ -56,6 +57,10 @@ async function main(): Promise<void> {
   if (!config.binance.useTestnet) logger.warn('*** MAINNET MODE: trading with REAL funds ***');
   if (!config.smtp) logger.warn('SMTP is not configured; notifications will only be logged');
   if (!config.anthropicApiKey) logger.warn('ANTHROPIC_API_KEY not set; incident emails will use a plain template');
+
+  // Listen before the (possibly slow) bot startup so hosts that scan for a port don't time out.
+  const port = Number(process.env.PORT);
+  if (Number.isInteger(port) && port > 0) startHealthServer(port, () => bot);
 
   notifier = new Notifier(createMailer(config.smtp));
   bot = new GridBot(config, new Exchange(config.binance), new StateStore(config.dataDir), notifier);

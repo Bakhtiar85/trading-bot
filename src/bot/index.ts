@@ -70,6 +70,7 @@ export class GridBot {
   private loopDone: Promise<void> | null = null;
   private consecutiveFailures = 0;
   private failureAlertSent = false;
+  private lastTickOkAt: number | null = null;
 
   constructor(
     private readonly config: Config,
@@ -281,6 +282,7 @@ export class GridBot {
     while (!this.stopRequested) {
       try {
         await this.tick();
+        this.lastTickOkAt = Date.now();
         this.consecutiveFailures = 0;
         this.failureAlertSent = false;
       } catch (err) {
@@ -697,6 +699,20 @@ export class GridBot {
       workingOrders: this.state.slots.filter((s) => s.clientOrderId !== null).length,
       uptimeHours: (Date.now() - this.startedAt) / 3_600_000,
       testnet: this.config.binance.useTestnet,
+    };
+  }
+
+  /**
+   * Liveness for the HTTP health endpoint: healthy once a check has succeeded recently.
+   * Deliberately exposes no balances or prices, since the endpoint may be public.
+   */
+  health(): { healthy: boolean; status: BotStatus | 'STARTING'; lastCheckAt: string | null } {
+    const maxAgeMs = this.config.checkIntervalSeconds * 1000 * 3 + 60_000;
+    const fresh = this.lastTickOkAt !== null && Date.now() - this.lastTickOkAt < maxAgeMs;
+    return {
+      healthy: fresh,
+      status: this.loopDone && this.state ? this.state.status : 'STARTING',
+      lastCheckAt: this.lastTickOkAt === null ? null : new Date(this.lastTickOkAt).toISOString(),
     };
   }
 
