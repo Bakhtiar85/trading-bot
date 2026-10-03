@@ -162,6 +162,38 @@ export function formatCrashEmail(err: unknown, testnet: boolean, symbol: string)
   };
 }
 
+export interface ConnectivityEvent {
+  kind: 'LOST' | 'RESTORED';
+  failures: number;
+  /** When the first failed check of this streak happened. */
+  since: string;
+  lastError: string;
+  testnet: boolean;
+  symbol: string;
+}
+
+/** Repeated failed checks. Unlike a crash, the process keeps running and retrying. */
+export function formatConnectivityEmail(e: ConnectivityEvent): EmailContent {
+  if (e.kind === 'LOST') {
+    return {
+      subject: `${subjectPrefix(e.testnet)} Checks failing - bot still running (${e.symbol})`,
+      text:
+        `The last ${e.failures} checks failed in a row, starting at ${e.since}. The bot is still running ` +
+        `and retrying every check, but while this lasts it cannot see the price, process fills, or apply ` +
+        `the stop-loss. Existing orders stay on Binance and keep working.\n\n` +
+        `Latest error: ${e.lastError}\n\n` +
+        `You will get another email when checks succeed again.\n`,
+    };
+  }
+  return {
+    subject: `${subjectPrefix(e.testnet)} Checks recovered (${e.symbol})`,
+    text:
+      `Checks are succeeding again after ${e.failures} failures in a row (first failure at ${e.since}). ` +
+      `Fills that happened in the meantime are processed normally and the risk rules are active again.\n\n` +
+      `Last error before recovery: ${e.lastError}\n`,
+  };
+}
+
 /** High-level notifier. Every method swallows and logs its own errors. */
 export class Notifier {
   constructor(private readonly mailer: Mailer) {}
@@ -182,6 +214,14 @@ export class Notifier {
     } catch (err) {
       logger.error(`Failed to send ${kind.toLowerCase()} email`, { error: errorMessage(err) });
       return false;
+    }
+  }
+
+  async connectivity(event: ConnectivityEvent): Promise<void> {
+    try {
+      await withTimeout(this.mailer.send(formatConnectivityEmail(event)), 20_000, 'Connectivity email');
+    } catch (err) {
+      logger.error('Failed to send connectivity email', { error: errorMessage(err), kind: event.kind });
     }
   }
 

@@ -27,11 +27,12 @@ import {
   sellQuantity,
 } from '../grid';
 import { errorMessage, logger } from '../logger';
-import { Notifier } from '../notifications';
+import { ConnectivityEvent, Notifier } from '../notifications';
 import { computeDrawdownPercent, computeEquity, createInitialState, evaluateRisk, StateStore } from '../risk';
 import type {
   BotStatus,
   Config,
+  HealthReport,
   IncidentContext,
   IncidentType,
   OrderState,
@@ -43,6 +44,7 @@ import type {
 
 const TERMINAL_ORDER_STATUSES = new Set(['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH']);
 const FAILURE_ALERT_THRESHOLD = 5;
+const STATUS_LOG_INTERVAL_MS = 30 * 60_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,7 +72,11 @@ export class GridBot {
   private loopDone: Promise<void> | null = null;
   private consecutiveFailures = 0;
   private failureAlertSent = false;
+  private failureStreakStartedAt: string | null = null;
+  private lastFailureMessage: string | null = null;
   private lastTickOkAt: number | null = null;
+  private lastTickAttemptAt: number | null = null;
+  private lastStatusLogAt = 0;
 
   constructor(
     private readonly config: Config,
@@ -283,23 +289,12 @@ export class GridBot {
       try {
         await this.tick();
         this.lastTickOkAt = Date.now();
-        this.consecutiveFailures = 0;
-        this.failureAlertSent = false;
+        await this.onTickRecovered();
       } catch (err) {
-        this.consecutiveFailures++;
-        logger.error('Tick failed', { error: errorMessage(err), consecutive: this.consecutiveFailures });
-        if (this.consecutiveFailures >= FAILURE_ALERT_THRESHOLD && !this.failureAlertSent) {
-          this.failureAlertSent = true;
-          await this.notifier.crash(
-            new Error(
-              `The last ${this.consecutiveFailures} checks failed (latest: ${errorMessage(err)}). ` +
-                'The bot is still running and retrying, but risk rules cannot be evaluated while this persists.',
-            ),
-            this.config.binance.useTestnet,
-            this.symbol,
-          );
-        }
+        await this.onTickFailed(err);
       }
+      this.lastTickAttemptAt = Date.now();
+      this.maybeLogStatus();
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, this.config.checkIntervalSeconds * 1000);
         this.wake = () => {
@@ -309,6 +304,56 @@ export class GridBot {
       });
       this.wake = null;
     }
+  }
+
+  private async onTickFailed(err: unknown): Promise<void> {
+    this.consecutiveFailures++;
+    this.lastFailureMessage = errorMessage(err);
+    if (this.consecutiveFailures === 1) this.failureStreakStartedAt = new Date().toISOString();
+    logger.error('Tick failed', { error: this.lastFailureMessage, consecutive: this.consecutiveFailures });
+    if (this.consecutiveFailures >= FAILURE_ALERT_THRESHOLD && !this.failureAlertSent) {
+      this.failureAlertSent = true;
+      await this.notifier.connectivity(this.connectivityEvent('LOST'));
+    }
+  }
+
+  private async onTickRecovered(): Promise<void> {
+    if (this.consecutiveFailures === 0) return;
+    logger.info('Checks recovered', { failures: this.consecutiveFailures, since: this.failureStreakStartedAt });
+    // Only announce recovery for streaks we alerted about; short blips stay log-only.
+    if (this.failureAlertSent) await this.notifier.connectivity(this.connectivityEvent('RESTORED'));
+    this.consecutiveFailures = 0;
+    this.failureAlertSent = false;
+    this.failureStreakStartedAt = null;
+  }
+
+  private connectivityEvent(kind: 'LOST' | 'RESTORED'): ConnectivityEvent {
+    return {
+      kind,
+      failures: this.consecutiveFailures,
+      since: this.failureStreakStartedAt ?? new Date().toISOString(),
+      lastError: this.lastFailureMessage ?? 'unknown',
+      testnet: this.config.binance.useTestnet,
+      symbol: this.symbol,
+    };
+  }
+
+  /**
+   * Successful ticks are otherwise silent, so without this a dead process and a quiet market look
+   * the same in the log. One line every STATUS_LOG_INTERVAL_MS shows the bot was alive.
+   */
+  private maybeLogStatus(): void {
+    if (Date.now() - this.lastStatusLogAt < STATUS_LOG_INTERVAL_MS) return;
+    this.lastStatusLogAt = Date.now();
+    const s = this.snapshot();
+    logger.info('Still running', {
+      status: s.status,
+      price: s.price,
+      equity: s.equityUsdt === null ? null : Number(s.equityUsdt.toFixed(2)),
+      drawdownPct: s.drawdownPercent === null ? null : Number(s.drawdownPercent.toFixed(2)),
+      workingOrders: s.workingOrders,
+      consecutiveFailures: this.consecutiveFailures,
+    });
   }
 
   async tick(): Promise<void> {
@@ -703,16 +748,20 @@ export class GridBot {
   }
 
   /**
-   * Liveness for the HTTP health endpoint: healthy once a check has succeeded recently.
-   * Deliberately exposes no balances or prices, since the endpoint may be public.
+   * Liveness for the HTTP health endpoint: healthy while the check loop keeps completing attempts,
+   * even failed ones. A host restart can't fix an exchange or network outage, so failing checks
+   * alone must not make the bot look dead; they're reported via consecutiveFailures instead.
+   * The margin covers slow ticks (Claude summary timeout, order retries during a halt).
    */
-  health(): { healthy: boolean; status: BotStatus | 'STARTING'; lastCheckAt: string | null } {
-    const maxAgeMs = this.config.checkIntervalSeconds * 1000 * 3 + 60_000;
-    const fresh = this.lastTickOkAt !== null && Date.now() - this.lastTickOkAt < maxAgeMs;
+  health(): HealthReport {
+    const maxAgeMs = this.config.checkIntervalSeconds * 1000 * 3 + 5 * 60_000;
+    const iso = (t: number | null): string | null => (t === null ? null : new Date(t).toISOString());
     return {
-      healthy: fresh,
+      healthy: this.lastTickAttemptAt !== null && Date.now() - this.lastTickAttemptAt < maxAgeMs,
       status: this.loopDone && this.state ? this.state.status : 'STARTING',
-      lastCheckAt: this.lastTickOkAt === null ? null : new Date(this.lastTickOkAt).toISOString(),
+      lastAttemptAt: iso(this.lastTickAttemptAt),
+      lastSuccessAt: iso(this.lastTickOkAt),
+      consecutiveFailures: this.consecutiveFailures,
     };
   }
 

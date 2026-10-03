@@ -160,6 +160,16 @@ export interface StatusSnapshot {
   testnet: boolean;
 }
 
+/** Body of GET /health. Deliberately carries no balances or prices, since the endpoint may be public. */
+export interface HealthReport {
+  /** The check loop is alive: an attempt (successful or not) finished recently. */
+  healthy: boolean;
+  status: BotStatus | 'STARTING';
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  consecutiveFailures: number;
+}
+
 export type RiskDecision =
   | { action: 'NONE' }
   | { action: 'STOP_LOSS'; drawdownPercent: number; equity: number }
