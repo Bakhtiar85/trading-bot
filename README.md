@@ -64,6 +64,7 @@ How the ordering is guaranteed:
 - The new status (PAUSED/STOPPED) is written to disk **before** any exchange action, so a crash halfway through can never leave the bot thinking it may keep trading.
 - Emails and Claude are called **only after** the protective action. They have their own timeouts, and their errors are swallowed, so they can never block or undo a stop-loss.
 - If the stop-loss sell itself fails (for example, the exchange is down), the bot stays STOPPED and **retries the sell on every check**. It also retries on restart. The email tells you it failed.
+- **A timed-out sell can never cause a double sell.** Before each stop-loss sell is sent, its ID is saved to disk. If Binance's response is lost, or Binance reports "execution status unknown", the bot looks that order up by ID before sending anything else. If it still can't tell what happened, the order stays marked as pending, including across restarts, and is settled first on the next check. A partly filled sell is recorded as partly filled, and the remainder is sold on the next check.
 - **The stop-loss also applies while PAUSED.** Coins held after a breakout below the range can keep falling. Selling them is protective, not a return to trading.
 
 ## Setup
@@ -181,6 +182,7 @@ Set `LOG_LEVEL=debug` to log price, equity, and drawdown on every check.
 | **Bot restarted after a crash** | First start after an unclean exit | Yes |
 | **Heartbeat** | Every `HEARTBEAT_INTERVAL_HOURS` (default daily) | No |
 | Crash-style warning | 5 consecutive failed checks, e.g. the exchange is unreachable. The bot keeps retrying. | No |
+| **WARNING: Account balance is below the bot ledger** | The every-10-minutes balance check finds your account holds less than the bot thinks it does, by more than the larger of 0.50 USDT and 1% of capital, on two checks in a row. Alert only: nothing is changed or traded. Extra funds in the account never trigger it. | No |
 
 Claude summaries are 3–5 sentences, written for a non-expert. They only describe what already happened and always end with *"This is not financial advice; you may want a second opinion before making further decisions."* The exact numbers are always listed under the summary as well.
 

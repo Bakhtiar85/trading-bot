@@ -23,6 +23,7 @@ export function createInitialState(configFingerprint: string, symbol: string, ca
     initialBuy: null,
     gridPlaced: false,
     liquidationComplete: false,
+    pendingSellClientOrderId: null,
     orderCounter: 0,
     lastHeartbeatAt: null,
     running: false,
@@ -59,6 +60,8 @@ export class StateStore {
       // Refuse to guess: a corrupt state file could hide a STOPPED status.
       throw new Error(`State file ${this.filePath} is invalid. Inspect it, then move it aside to start fresh.`);
     }
+    // Fields added after the first release; default them so existing state files keep loading.
+    parsed.pendingSellClientOrderId ??= null;
     return parsed;
   }
 

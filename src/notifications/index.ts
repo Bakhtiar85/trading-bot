@@ -225,6 +225,16 @@ export class Notifier {
     }
   }
 
+  /** Plain operational warning (no Claude summary). */
+  async alert(title: string, body: string, testnet: boolean, symbol: string): Promise<void> {
+    try {
+      const email = { subject: `${subjectPrefix(testnet)} WARNING: ${title} (${symbol})`, text: body };
+      await withTimeout(this.mailer.send(email), 20_000, 'Alert email');
+    } catch (err) {
+      logger.error('Failed to send alert email', { error: errorMessage(err), title });
+    }
+  }
+
   async crash(err: unknown, testnet: boolean, symbol: string): Promise<void> {
     try {
       await withTimeout(this.mailer.send(formatCrashEmail(err, testnet, symbol)), 20_000, 'Crash email');

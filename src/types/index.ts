@@ -113,6 +113,11 @@ export interface PersistedState {
   gridPlaced: boolean;
   /** Only meaningful when STOPPED: whether the stop-loss sell completed. Retried on restart if false. */
   liquidationComplete: boolean;
+  /**
+   * Client id of a stop-loss sell whose outcome is not yet known (e.g. the request timed out).
+   * No new sell may be sent until this is resolved, so a timeout can never cause a double sell.
+   */
+  pendingSellClientOrderId: string | null;
   orderCounter: number;
   lastHeartbeatAt: string | null;
   /** Set true while running; cleared on graceful shutdown. true at startup => previous run crashed. */

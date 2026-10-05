@@ -15,7 +15,7 @@
  *     when the grid config fingerprint changes and the process restarts (see prepareState).
  */
 import { configFingerprint } from '../config';
-import { binanceErrorCode, Exchange, OrderSnapshot } from '../exchange';
+import { Exchange, isUnknownOutcome, OrderSnapshot } from '../exchange';
 import {
   computeGridPlan,
   ESTIMATED_FEE_RATE,
@@ -28,7 +28,14 @@ import {
 } from '../grid';
 import { errorMessage, logger } from '../logger';
 import { ConnectivityEvent, Notifier } from '../notifications';
-import { computeDrawdownPercent, computeEquity, createInitialState, evaluateRisk, StateStore } from '../risk';
+import {
+  checkLedgerAgainstAccount,
+  computeDrawdownPercent,
+  computeEquity,
+  createInitialState,
+  evaluateRisk,
+  StateStore,
+} from '../risk';
 import type {
   BotStatus,
   Config,
@@ -45,6 +52,7 @@ import type {
 const TERMINAL_ORDER_STATUSES = new Set(['FILLED', 'CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCH']);
 const FAILURE_ALERT_THRESHOLD = 5;
 const STATUS_LOG_INTERVAL_MS = 30 * 60_000;
+const LEDGER_CHECK_INTERVAL_MS = 10 * 60_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -77,6 +85,9 @@ export class GridBot {
   private lastTickOkAt: number | null = null;
   private lastTickAttemptAt: number | null = null;
   private lastStatusLogAt = 0;
+  private lastLedgerCheckAt = 0;
+  private ledgerMismatches = 0;
+  private ledgerAlertSent = false;
 
   constructor(
     private readonly config: Config,
@@ -399,7 +410,8 @@ export class GridBot {
 
     if (this.state.status === 'RUNNING') {
       await this.ensureOrders();
-    } else if (this.state.status === 'STOPPED' && !this.state.liquidationComplete) {
+    } else if (this.state.status === 'STOPPED' && !this.state.liquidationComplete && decision.action !== 'STOP_LOSS') {
+      // Unfinished stop-loss sells are retried on later checks, not straight after the attempt.
       await this.retryLiquidation(price);
     }
 
@@ -411,7 +423,81 @@ export class GridBot {
       drawdownPct: Number(computeDrawdownPercent(this.config.grid.capitalUsdt, equity).toFixed(2)),
     });
 
+    try {
+      await this.maybeCheckLedger(price);
+    } catch (err) {
+      logger.warn('Ledger check failed', { error: errorMessage(err) });
+    }
+
     await this.maybeHeartbeat();
+  }
+
+  /**
+   * Alert-only check that the account actually holds what the ledger says the bot holds. It never
+   * changes the ledger or trades. It flags drift from fee estimates, missed fills or manual changes.
+   */
+  private async maybeCheckLedger(price: number): Promise<void> {
+    if (Date.now() - this.lastLedgerCheckAt < LEDGER_CHECK_INTERVAL_MS) return;
+    this.lastLedgerCheckAt = Date.now();
+
+    const balances = await this.exchange.getBalances();
+    const total = (asset: string): number => {
+      const b = balances.get(asset);
+      return b ? b.free + b.locked : 0;
+    };
+    const check = checkLedgerAgainstAccount(
+      this.state.ledger,
+      { base: total(this.filters.baseAsset), quote: total(this.filters.quoteAsset) },
+      price,
+      this.config.grid.capitalUsdt,
+    );
+
+    if (!check.exceeded) {
+      if (this.ledgerMismatches > 0) logger.info('Ledger matches the account again');
+      this.ledgerMismatches = 0;
+      this.ledgerAlertSent = false;
+      return;
+    }
+
+    this.ledgerMismatches++;
+    logger.warn('Account holds less than the bot ledger says', {
+      baseShortfall: check.baseShortfall,
+      quoteShortfall: Number(check.quoteShortfall.toFixed(2)),
+      shortfallUsdt: Number(check.shortfallUsdt.toFixed(2)),
+      toleranceUsdt: check.toleranceUsdt,
+      consecutive: this.ledgerMismatches,
+    });
+
+    if (this.ledgerMismatches < 2) {
+      // An order can fill between the order sync and the balance fetch, which looks like a gap
+      // until the next sync books it. Recheck on the next tick before alerting.
+      this.lastLedgerCheckAt = 0;
+      return;
+    }
+    if (this.ledgerAlertSent) return;
+    this.ledgerAlertSent = true;
+
+    const { baseAsset, quoteAsset } = this.filters;
+    const ledger = this.state.ledger;
+    await this.notifier.alert(
+      'Account balance is below the bot ledger',
+      [
+        'The bot\'s internal ledger says it holds more than your Binance account actually has.',
+        'Nothing was changed and no trades were made because of this check. The bot keeps running,',
+        'but its drawdown and stop-loss figures are based on the ledger, so they may be too optimistic.',
+        '',
+        `Ledger:     ${ledger.base} ${baseAsset} + ${ledger.quote.toFixed(2)} ${quoteAsset}`,
+        `Account:    ${total(baseAsset)} ${baseAsset} + ${total(quoteAsset).toFixed(2)} ${quoteAsset} (free + in orders)`,
+        `Shortfall:  ~${check.shortfallUsdt.toFixed(2)} ${quoteAsset} (tolerance ${check.toleranceUsdt.toFixed(2)})`,
+        `Price:      ${price}`,
+        '',
+        'Common causes: funds moved or traded manually, an order handled outside the bot, or a',
+        'missed fill. Check your Binance order history. If the account is wrong, consider stopping',
+        'the bot.',
+      ].join('\n'),
+      this.config.binance.useTestnet,
+      this.symbol,
+    );
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -501,9 +587,9 @@ export class GridBot {
         if (slot.side === 'SELL' && freeBase !== null) freeBase -= quantity;
         logger.info(`Slot ${slot.index}: placed ${slot.side} ${quantity} @ ${price}`);
       } catch (err) {
-        // A coded Binance error means the exchange rejected it (no order exists). Otherwise the
-        // outcome is unknown; keep the id and let the next sync find out.
-        if (binanceErrorCode(err) !== null) this.clearOrder(slot);
+        // A definite rejection means no order exists. If the outcome is unknown (timeout, or a
+        // Binance "execution status unknown" code), keep the id and let the next sync find out.
+        if (!isUnknownOutcome(err)) this.clearOrder(slot);
         logger.error(`Slot ${slot.index}: failed to place ${slot.side} @ ${price}`, { error: errorMessage(err) });
       }
       this.save();
@@ -617,6 +703,10 @@ export class GridBot {
     }
 
     try {
+      // A sell from an earlier attempt may have an unknown outcome; settle it before sending more.
+      const earlier = await this.resolvePendingSell();
+      if (earlier) actions.push(this.bookStopLossSell(earlier, 'an earlier attempt'));
+
       const balances = await this.exchange.getBalances();
       const freeBase = balances.get(this.filters.baseAsset)?.free ?? 0;
       const qty = roundToStep(Math.min(this.state.ledger.base, freeBase), this.filters.stepSize, 'down');
@@ -625,47 +715,106 @@ export class GridBot {
         actions.push(
           qty > 0
             ? `Left ${qty} ${this.filters.baseAsset} unsold: below the exchange minimum order size`
-            : `No ${this.filters.baseAsset} held by the bot, so nothing to sell`,
+            : `No ${this.filters.baseAsset} left for the bot to sell`,
         );
       } else {
-        const snap = await this.marketSellWithRetry(qty);
-        this.applyExecution('SELL', snap.executedQty, snap.cummulativeQuoteQty);
-        const avg = snap.executedQty > 0 ? snap.cummulativeQuoteQty / snap.executedQty : price;
-        actions.push(
-          `Sold ${snap.executedQty} ${this.filters.baseAsset} at market (avg ~${avg.toFixed(2)}) for ` +
-            `${snap.cummulativeQuoteQty.toFixed(2)} ${this.filters.quoteAsset}`,
-        );
+        const snap = await this.marketSell(qty);
+        actions.push(this.bookStopLossSell(snap, 'this attempt'));
+        if (snap.status !== 'FILLED') {
+          // Partly filled market order (thin order book). The remainder is sold on the next check.
+          throw new Error(`market sell ended ${snap.status} after selling ${snap.executedQty} of ${qty}`);
+        }
       }
       this.state.liquidationComplete = true;
       actions.push('Set the bot to STOPPED; it will not trade again until reconfigured and restarted');
     } catch (err) {
-      logger.error('Stop-loss sell FAILED; will retry every tick', { error: errorMessage(err) });
+      logger.error('Stop-loss sell did not complete; will retry every check', { error: errorMessage(err) });
       actions.push(
-        `WARNING: the market sell FAILED (${errorMessage(err)}). The bot is STOPPED and will keep retrying ` +
-          'the sell every check. You may want to check your Binance account directly.',
+        `WARNING: the market sell did not complete (${errorMessage(err)}). The bot is STOPPED and will keep ` +
+          'retrying the sell every check. You may want to check your Binance account directly.',
       );
     }
     this.save();
     return actions;
   }
 
-  /** Market sell with retries; checks whether a previous attempt went through before re-sending. */
-  private async marketSellWithRetry(quantity: number): Promise<OrderSnapshot> {
+  /** Book a stop-loss sell into the ledger and describe it for the incident email. */
+  private bookStopLossSell(snap: OrderSnapshot, source: string): string {
+    this.applyExecution('SELL', snap.executedQty, snap.cummulativeQuoteQty);
+    const avg = snap.executedQty > 0 ? snap.cummulativeQuoteQty / snap.executedQty : 0;
+    return (
+      `Sold ${snap.executedQty} ${this.filters.baseAsset} at market (avg ~${avg.toFixed(2)}) for ` +
+      `${snap.cummulativeQuoteQty.toFixed(2)} ${this.filters.quoteAsset} (${source})`
+    );
+  }
+
+  /**
+   * Send a stop-loss market sell.
+   *
+   * Invariant: a new sell is never sent while an earlier one's outcome is unknown. The client id
+   * is persisted as pending before sending. A definite rejection clears it and retries with a
+   * fresh id. An unknown outcome (timeout etc.) is looked up by that id first; if Binance still
+   * can't say what happened, the id stays pending, this throws, and the next check resolves it
+   * before doing anything else, even after a restart.
+   */
+  private async marketSell(quantity: number): Promise<OrderSnapshot> {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
       const clientOrderId = this.newClientOrderId('sl');
+      this.state.pendingSellClientOrderId = clientOrderId;
       this.save();
       try {
-        return await this.exchange.placeMarketOrder({ filters: this.filters, side: 'SELL', quantity, clientOrderId });
+        const snap = await this.exchange.placeMarketOrder({ filters: this.filters, side: 'SELL', quantity, clientOrderId });
+        this.state.pendingSellClientOrderId = null;
+        this.save();
+        return snap;
       } catch (err) {
         lastErr = err;
-        logger.error(`Stop-loss market sell attempt ${attempt} failed`, { error: errorMessage(err) });
+        const unknown = isUnknownOutcome(err);
+        logger.error(`Stop-loss market sell attempt ${attempt} failed`, { error: errorMessage(err), unknownOutcome: unknown });
+        if (unknown) {
+          const executed = await this.resolvePendingSell(); // throws if still unknown
+          if (executed) return executed;
+          // Confirmed it never executed, so trying again can't double-sell.
+        } else {
+          this.state.pendingSellClientOrderId = null;
+          this.save();
+        }
         await sleep(2_000 * attempt);
-        const existing = await this.exchange.getOrder(this.symbol, clientOrderId).catch(() => null);
-        if (existing && existing.status === 'FILLED') return existing;
       }
     }
     throw lastErr;
+  }
+
+  /**
+   * Settle the pending stop-loss sell, if any. Returns its snapshot when it sold something, or
+   * null when there was none or it never executed. Throws, leaving it pending, when Binance can't
+   * be reached or the order hasn't finished.
+   */
+  private async resolvePendingSell(): Promise<OrderSnapshot | null> {
+    const id = this.state.pendingSellClientOrderId;
+    if (id === null) return null;
+
+    // Right after a timeout an order can briefly be invisible, so "not found" is only trusted
+    // after it has been seen repeatedly. A lookup error is never treated as "not found".
+    let snap: OrderSnapshot | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await sleep(2_000 * attempt);
+      snap = await this.exchange.getOrder(this.symbol, id);
+      if (snap !== null) break;
+    }
+    if (snap !== null && !TERMINAL_ORDER_STATUSES.has(snap.status)) {
+      throw new Error(`earlier stop-loss sell ${id} is still ${snap.status}`);
+    }
+
+    logger.info(`Resolved pending stop-loss sell ${id}`, {
+      found: snap !== null,
+      status: snap?.status,
+      executedQty: snap?.executedQty ?? 0,
+    });
+    this.state.pendingSellClientOrderId = null;
+    this.save();
+    return snap !== null && snap.executedQty > 0 ? snap : null;
   }
 
   // ---------------------------------------------------------------------------------------------

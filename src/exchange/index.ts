@@ -15,6 +15,8 @@ export const BINANCE_ERR = {
   UNKNOWN_ORDER: -2011, // cancel on an order that no longer exists
   NO_SUCH_ORDER: -2013, // query on an order that never existed
   INSUFFICIENT_BALANCE: -2010,
+  UNEXPECTED_RESPONSE: -1006, // "execution status unknown"
+  BACKEND_TIMEOUT: -1007, // "send status unknown; execution status unknown"
 } as const;
 
 export interface OrderSnapshot {
@@ -51,6 +53,17 @@ export function binanceErrorCode(err: unknown): number | null {
     return Number.isFinite(code) ? code : null;
   }
   return null;
+}
+
+/**
+ * True when an order submission failed in a way that leaves its outcome unknown: a network error
+ * or timeout (no Binance code), or one of the codes Binance documents as "execution status
+ * unknown". Such an order may still have executed and must be looked up by client id before
+ * anything else is sent. Any other coded error is a definite rejection: no order exists.
+ */
+export function isUnknownOutcome(err: unknown): boolean {
+  const code = binanceErrorCode(err);
+  return code === null || code === BINANCE_ERR.UNEXPECTED_RESPONSE || code === BINANCE_ERR.BACKEND_TIMEOUT;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
