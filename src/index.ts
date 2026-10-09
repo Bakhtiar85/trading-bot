@@ -5,6 +5,7 @@ import { configureLogger, errorMessage, logger } from './logger';
 import { startHealthServer } from './health';
 import { createMailer, Notifier } from './notifications';
 import { StateStore } from './risk';
+import { startStatusServer } from './status';
 import type { Config } from './types';
 
 let bot: GridBot | null = null;
@@ -61,6 +62,8 @@ async function main(): Promise<void> {
   // Listen before the (possibly slow) bot startup so hosts that scan for a port don't time out.
   const port = Number(process.env.PORT);
   if (Number.isInteger(port) && port > 0) startHealthServer(port, () => bot);
+  // Started early too, so it can show startup problems in the logs.
+  if (config.statusPage) startStatusServer(config.statusPage, config.logDir, () => bot);
 
   notifier = new Notifier(createMailer(config.smtp));
   bot = new GridBot(config, new Exchange(config.binance), new StateStore(config.dataDir), notifier);

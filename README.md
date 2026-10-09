@@ -157,6 +157,39 @@ PM2 on a VPS is the intended setup. If you deploy to Render instead:
 - **Don't use the free Web Service tier.** It sleeps after about 15 minutes without incoming HTTP traffic, and while asleep the bot stops checking prices and the stop-loss can't fire.
 - Set the build command to `npm ci && npm run build` and the start command to `node dist/index.js`. PM2 isn't needed there, because Render restarts the process itself.
 
+## Status page (check from your phone)
+
+This is an optional, password-protected page showing the bot's status, equity, drawdown, check health and recent logs. It refreshes every 60 seconds and is **read-only**: it has no buttons to pause, resume or trade, so a leaked password can't move money.
+
+| URL | Shows | Password |
+|---|---|---|
+| `/` | Mobile page. `?level=warn` or `?level=error` filters the logs; `?lines=500` shows more. | Yes |
+| `/api/status` | Status as JSON | Yes |
+| `/api/logs?level=warn&lines=200` | Log entries as JSON | Yes |
+| `/health` | Is it alive? No details. | No |
+
+**1. Enable it in the bot.** Set `STATUS_PASSWORD` in `.env` (at least 12 characters), then `pm2 restart grid-bot`. It listens on `127.0.0.1:8080`, so it's not reachable from the internet yet. That's intentional: without HTTPS the password would travel unencrypted.
+
+**2. Add HTTPS with Caddy and sslip.io.** No account or domain is needed. `sslip.io` is a free public service: a name like `51-79-220-79.sslip.io` always points to the IP `51.79.220.79`. Caddy automatically gets a real HTTPS certificate for that name. On the VPS (Ubuntu/Debian), replace the dashed IP with your own:
+
+```bash
+sudo apt update && sudo apt install -y caddy
+printf '51-79-220-79.sslip.io {\n    reverse_proxy 127.0.0.1:8080\n}\n' | sudo tee /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+sudo ufw allow 80,443/tcp    # only if the ufw firewall is enabled
+```
+
+**3. Open `https://51-79-220-79.sslip.io` on your phone.** The browser asks for a username and password. The username can be anything; the password is your `STATUS_PASSWORD`. Your browser can save it, and you can add the page to your home screen.
+
+Protections:
+
+- After 5 wrong passwords, that address is blocked for 15 minutes, and each failed attempt is logged.
+- Password comparisons are constant-time.
+- Pages are never cached.
+- If the page fails to start (for example, the port is already in use), the bot logs it and keeps trading without the page.
+
+If the certificate step ever fails, run `journalctl -u caddy -n 50`. The usual cause is ports 80/443 being blocked by a firewall, including OVH's network firewall in the OVH control panel.
+
 ## Logs and state
 
 | What | Where |
@@ -216,6 +249,7 @@ src/
   types/           shared interfaces (GridConfig, RiskConfig, OrderState, IncidentContext, …)
   logger.ts        Winston: console + daily-rotating JSON file
   health.ts        optional GET /health endpoint, only when PORT is set
+  status/          optional password-protected, read-only status + logs page
   index.ts         entrypoint, crash + signal handlers
 ```
 

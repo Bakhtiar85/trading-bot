@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import dotenv from 'dotenv';
-import type { Config, SmtpConfig } from '../types';
+import type { Config, SmtpConfig, StatusPageConfig } from '../types';
 
 const MAINNET_HTTP_BASE = 'https://api.binance.com';
 // Binance Spot Testnet (keys from https://testnet.binance.vision). Note: binance-api-node's own
@@ -58,6 +58,16 @@ function loadSmtp(env: Env): SmtpConfig | null {
   };
 }
 
+function loadStatusPage(env: Env): StatusPageConfig | null {
+  const password = str(env, 'STATUS_PASSWORD', false);
+  if (password === '') return null;
+  if (password.length < 12) throw new ConfigError('STATUS_PASSWORD must be at least 12 characters');
+  const port = num(env, 'STATUS_PORT', 8080);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new ConfigError('STATUS_PORT must be 1-65535');
+  // Loopback by default: put an HTTPS reverse proxy (e.g. Caddy) in front. See README.
+  return { password, host: str(env, 'STATUS_HOST', false) || '127.0.0.1', port };
+}
+
 /** Parse and validate an env map into a typed Config. Pure apart from reading `env`. */
 export function parseConfig(env: Env): Config {
   const useTestnet = bool(env, 'BINANCE_USE_TESTNET', true);
@@ -102,6 +112,7 @@ export function parseConfig(env: Env): Config {
     risk: { stopLossPercent, breakoutPause: bool(env, 'BREAKOUT_PAUSE', true) },
     checkIntervalSeconds,
     heartbeatIntervalHours,
+    statusPage: loadStatusPage(env),
     anthropicApiKey: anthropicApiKey === '' ? null : anthropicApiKey,
     smtp: loadSmtp(env),
     logLevel: str(env, 'LOG_LEVEL', false) || 'info',

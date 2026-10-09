@@ -36,12 +36,20 @@ export interface SmtpConfig {
   to: string;
 }
 
+/** Password-protected status/logs page. null when STATUS_PASSWORD is not set (page disabled). */
+export interface StatusPageConfig {
+  password: string;
+  host: string;
+  port: number;
+}
+
 export interface Config {
   binance: BinanceConfig;
   grid: GridConfig;
   risk: RiskConfig;
   checkIntervalSeconds: number;
   heartbeatIntervalHours: number;
+  statusPage: StatusPageConfig | null;
   anthropicApiKey: string | null;
   /** null when SMTP is not configured; emails are then only logged. */
   smtp: SmtpConfig | null;

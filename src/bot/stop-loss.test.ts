@@ -32,6 +32,7 @@ function makeConfig(dataDir: string): Config {
     risk: { stopLossPercent: 15, breakoutPause: true },
     checkIntervalSeconds: 60,
     heartbeatIntervalHours: 24,
+    statusPage: null,
     anthropicApiKey: null,
     smtp: null,
     logLevel: 'error',
