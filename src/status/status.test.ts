@@ -123,6 +123,12 @@ describe('renderPage', () => {
     consecutiveFailures: 0,
   };
 
+  it('scopes badge colours to the badge so warn/error log rows are not highlighted', () => {
+    const html = renderPage(health, null, [], 'info', 200);
+    expect(html).toContain('.badge.warn');
+    expect(html).not.toMatch(/[^.\w]\.warn\s*\{/);
+  });
+
   it('escapes log content so it cannot inject HTML', () => {
     const html = renderPage(
       health,

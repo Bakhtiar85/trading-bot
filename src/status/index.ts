@@ -232,7 +232,7 @@ export function renderPage(
   :root { color-scheme: light dark; --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e; --muted:#6e7781; }
   body { font: 15px/1.45 system-ui, sans-serif; margin: 0; padding: 16px; max-width: 900px; margin-inline: auto; }
   h1 { font-size: 22px; margin: 0 0 4px; } .badge { display:inline-block; padding:2px 10px; border-radius:12px; color:#fff; font-weight:600; }
-  .ok { background: var(--ok); } .warn { background: var(--warn); } .bad { background: var(--bad); }
+  .badge.ok { background: var(--ok); } .badge.warn { background: var(--warn); } .badge.bad { background: var(--bad); }
   table { border-collapse: collapse; width: 100%; margin: 12px 0 20px; } td { padding: 6px 4px; border-bottom: 1px solid #8884; vertical-align: top; }
   td:first-child { color: var(--muted); white-space: nowrap; width: 1%; padding-right: 16px; }
   .muted { color: var(--muted); } h2 { font-size: 17px; margin: 0 0 6px; }
