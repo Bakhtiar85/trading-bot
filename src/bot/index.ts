@@ -15,7 +15,7 @@
  *     when the grid config fingerprint changes and the process restarts (see prepareState).
  */
 import { configFingerprint } from '../config';
-import { Exchange, isUnknownOutcome, OrderSnapshot } from '../exchange';
+import { Exchange, isUnknownOutcome, OrderFees, OrderSnapshot } from '../exchange';
 import {
   computeGridPlan,
   ESTIMATED_FEE_RATE,
@@ -24,7 +24,6 @@ import {
   initialSides,
   isSpacingProfitable,
   roundToStep,
-  sellQuantity,
 } from '../grid';
 import { errorMessage, logger } from '../logger';
 import { ConnectivityEvent, Notifier } from '../notifications';
@@ -281,7 +280,12 @@ export class GridBot {
           clientOrderId: init.clientOrderId,
         });
       }
-      this.applyExecution('BUY', snap.executedQty, snap.cummulativeQuoteQty);
+      const received = this.applyExecution('BUY', snap.executedQty, snap.cummulativeQuoteQty, await this.feesFor(snap));
+      if (received !== null && snap.executedQty > 0) {
+        // Share what actually arrived across the sell-side slots, in proportion to what each bought.
+        const ratio = received / snap.executedQty;
+        for (const slot of this.state.slots) if (slot.side === 'SELL') slot.heldQuantity = slot.quantity * ratio;
+      }
       init.done = true;
       this.save();
     }
@@ -516,12 +520,12 @@ export class GridBot {
       const id = slot.clientOrderId;
       if (id === null || openIds.has(id)) continue;
       const snap = await this.exchange.getOrder(this.symbol, id);
-      this.handleFinishedOrder(slot, snap);
+      await this.handleFinishedOrder(slot, snap);
     }
   }
 
   /** Apply the final state of an order that is no longer open on the exchange. */
-  private handleFinishedOrder(slot: OrderState, snap: OrderSnapshot | null): void {
+  private async handleFinishedOrder(slot: OrderState, snap: OrderSnapshot | null): Promise<void> {
     if (snap === null) {
       // Id was reserved but the order never reached the exchange (e.g. crash between save and send).
       logger.warn(`Slot ${slot.index}: order ${slot.clientOrderId} not found on exchange; will re-place`);
@@ -531,17 +535,23 @@ export class GridBot {
     if (!TERMINAL_ORDER_STATUSES.has(snap.status)) return;
 
     if (snap.status === 'FILLED') {
-      this.applyExecution(slot.side, snap.executedQty, snap.cummulativeQuoteQty);
+      const fees = await this.feesFor(snap);
+      const baseMoved = this.applyExecution(slot.side, snap.executedQty, snap.cummulativeQuoteQty, fees);
       this.state.ledger.realizedTrades++;
+      // A buy hands its coins to the slot's sell; null = fee unknown, so the sell uses the estimate.
+      slot.heldQuantity = slot.side === 'BUY' ? baseMoved : null;
       const next: Side = slot.side === 'BUY' ? 'SELL' : 'BUY';
       logger.info(`Slot ${slot.index}: ${slot.side} filled`, {
         qty: snap.executedQty,
         price: slot.side === 'BUY' ? slot.buyPrice : slot.sellPrice,
+        fees: fees ?? 'estimated',
         next: `${next} @ ${next === 'BUY' ? slot.buyPrice : slot.sellPrice}`,
       });
       slot.side = next;
     } else {
-      if (snap.executedQty > 0) this.applyExecution(slot.side, snap.executedQty, snap.cummulativeQuoteQty);
+      if (snap.executedQty > 0) {
+        this.applyExecution(slot.side, snap.executedQty, snap.cummulativeQuoteQty, await this.feesFor(snap));
+      }
       logger.warn(`Slot ${slot.index}: order ${snap.clientOrderId} ended as ${snap.status}; will re-place`, {
         executedQty: snap.executedQty,
       });
@@ -564,9 +574,13 @@ export class GridBot {
       if (this.state.status !== 'RUNNING' || this.stopRequested) return;
 
       const price = slot.side === 'BUY' ? slot.buyPrice : slot.sellPrice;
-      let quantity = slot.side === 'BUY' ? slot.quantity : sellQuantity(slot.quantity, this.filters.stepSize);
-      if (slot.side === 'SELL' && freeBase !== null) {
-        quantity = roundToStep(Math.min(quantity, freeBase), this.filters.stepSize, 'down');
+      let quantity = slot.quantity;
+      if (slot.side === 'SELL') {
+        // Sell what the slot actually received when known (all of it if the fee was paid in BNB),
+        // otherwise assume the estimated fee was taken. Never more than the slot bought or than
+        // is free in the account, so the bot can't sell coins that aren't its own.
+        const held = slot.heldQuantity ?? slot.quantity * (1 - ESTIMATED_FEE_RATE);
+        quantity = roundToStep(Math.min(held, slot.quantity, freeBase ?? Infinity), this.filters.stepSize, 'down');
       }
       if (quantity < this.filters.minQty || quantity * price < this.filters.minNotional) {
         logger.warn(`Slot ${slot.index}: ${slot.side} quantity ${quantity} too small to place; skipping for now`);
@@ -614,7 +628,7 @@ export class GridBot {
         // Already gone? Find out whether it filled first.
         if (snap === null) snap = await this.exchange.getOrder(this.symbol, id);
         if (snap && snap.status === 'CANCELED') cancelled++;
-        this.handleFinishedOrder(slot, snap);
+        await this.handleFinishedOrder(slot, snap);
       } catch (err) {
         failures++;
         logger.error(`Failed to cancel order ${id}`, { error: errorMessage(err) });
@@ -627,7 +641,9 @@ export class GridBot {
       const strays = (await this.exchange.getOpenOrders(this.symbol)).filter((o) => o.clientOrderId.startsWith(prefix));
       for (const o of strays) {
         const snap = await this.exchange.cancelOrder(this.symbol, o.clientOrderId);
-        if (snap && snap.executedQty > 0) this.applyExecution(snap.side, snap.executedQty, snap.cummulativeQuoteQty);
+        if (snap && snap.executedQty > 0) {
+          this.applyExecution(snap.side, snap.executedQty, snap.cummulativeQuoteQty, await this.feesFor(snap));
+        }
         cancelled++;
       }
     } catch (err) {
@@ -705,7 +721,7 @@ export class GridBot {
     try {
       // A sell from an earlier attempt may have an unknown outcome; settle it before sending more.
       const earlier = await this.resolvePendingSell();
-      if (earlier) actions.push(this.bookStopLossSell(earlier, 'an earlier attempt'));
+      if (earlier) actions.push(await this.bookStopLossSell(earlier, 'an earlier attempt'));
 
       const balances = await this.exchange.getBalances();
       const freeBase = balances.get(this.filters.baseAsset)?.free ?? 0;
@@ -719,7 +735,7 @@ export class GridBot {
         );
       } else {
         const snap = await this.marketSell(qty);
-        actions.push(this.bookStopLossSell(snap, 'this attempt'));
+        actions.push(await this.bookStopLossSell(snap, 'this attempt'));
         if (snap.status !== 'FILLED') {
           // Partly filled market order (thin order book). The remainder is sold on the next check.
           throw new Error(`market sell ended ${snap.status} after selling ${snap.executedQty} of ${qty}`);
@@ -739,8 +755,8 @@ export class GridBot {
   }
 
   /** Book a stop-loss sell into the ledger and describe it for the incident email. */
-  private bookStopLossSell(snap: OrderSnapshot, source: string): string {
-    this.applyExecution('SELL', snap.executedQty, snap.cummulativeQuoteQty);
+  private async bookStopLossSell(snap: OrderSnapshot, source: string): Promise<string> {
+    this.applyExecution('SELL', snap.executedQty, snap.cummulativeQuoteQty, await this.feesFor(snap));
     const avg = snap.executedQty > 0 ? snap.cummulativeQuoteQty / snap.executedQty : 0;
     return (
       `Sold ${snap.executedQty} ${this.filters.baseAsset} at market (avg ~${avg.toFixed(2)}) for ` +
@@ -821,17 +837,40 @@ export class GridBot {
   // Helpers
   // ---------------------------------------------------------------------------------------------
 
-  /** Book an execution into the bot's ledger. Fees are estimated at ESTIMATED_FEE_RATE. */
-  private applyExecution(side: Side, executedQty: number, quoteQty: number): void {
+  /** Actual fees Binance charged for an executed order; null (use the estimate) if unavailable. */
+  private async feesFor(snap: OrderSnapshot): Promise<OrderFees | null> {
+    if (snap.fees) return snap.fees;
+    if (snap.executedQty <= 0) return { base: 0, quote: 0, other: {} };
+    try {
+      return await this.exchange.getOrderFees(this.filters, snap.orderId);
+    } catch (err) {
+      logger.warn(`Could not fetch actual fees for order ${snap.clientOrderId}; using the 0.1% estimate`, {
+        error: errorMessage(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Book an execution into the bot's ledger, using the fees Binance actually charged when known
+   * and otherwise assuming ESTIMATED_FEE_RATE was taken from what was received. Fees paid in
+   * another asset (e.g. BNB) come from outside the bot's capital and don't change the ledger.
+   * Returns the exact base amount received (BUY) or given up (SELL), or null if fees were estimated.
+   */
+  private applyExecution(side: Side, executedQty: number, quoteQty: number, fees: OrderFees | null): number | null {
     const ledger = this.state.ledger;
+    let baseMoved: number;
     if (side === 'BUY') {
-      ledger.quote -= quoteQty;
-      ledger.base += executedQty * (1 - ESTIMATED_FEE_RATE);
+      baseMoved = fees ? executedQty - fees.base : executedQty * (1 - ESTIMATED_FEE_RATE);
+      ledger.base += baseMoved;
+      ledger.quote -= quoteQty + (fees?.quote ?? 0);
     } else {
-      ledger.base = Math.max(0, ledger.base - executedQty);
-      ledger.quote += quoteQty * (1 - ESTIMATED_FEE_RATE);
+      baseMoved = executedQty + (fees?.base ?? 0);
+      ledger.base = Math.max(0, ledger.base - baseMoved);
+      ledger.quote += fees ? quoteQty - fees.quote : quoteQty * (1 - ESTIMATED_FEE_RATE);
     }
     ledger.base = roundToStep(ledger.base, this.filters.stepSize / 1000, 'nearest');
+    return fees ? baseMoved : null;
   }
 
   private clearOrder(slot: OrderState): void {

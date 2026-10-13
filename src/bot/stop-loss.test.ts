@@ -68,6 +68,7 @@ function fakeExchange() {
     cancelOrder: vi.fn(async (): Promise<OrderSnapshot | null> => null),
     getBalances: vi.fn(async () => new Map([['BTC', { free: btc, locked: 0 }], ['USDT', { free: 40, locked: 0 }]])),
     getOrder: vi.fn(async (_symbol: string, _id: string): Promise<OrderSnapshot | null> => null),
+    getOrderFees: vi.fn(async () => ({ base: 0, quote: 0, other: { BNB: 0.000001 } })),
     placeMarketOrder: vi.fn(async (p: { quantity: number; clientOrderId: string }): Promise<OrderSnapshot> => {
       btc -= p.quantity;
       return filled(p.clientOrderId, p.quantity);

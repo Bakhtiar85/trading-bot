@@ -28,6 +28,18 @@ export interface OrderSnapshot {
   origQty: number;
   executedQty: number;
   cummulativeQuoteQty: number;
+  /** Actual fees charged, when the response included fills (market orders with FULL responses). */
+  fees?: OrderFees;
+}
+
+/** Fees Binance actually charged for an order, by asset. */
+export interface OrderFees {
+  /** Fee taken from the base asset (e.g. BTC), reducing what a buy delivers. */
+  base: number;
+  /** Fee taken from the quote asset (USDT). */
+  quote: number;
+  /** Fees paid in any other asset, e.g. { BNB: 0.0000123 } when "pay fees with BNB" is on. */
+  other: Record<string, number>;
 }
 
 export interface Balance {
@@ -45,6 +57,8 @@ interface UntypedEndpoints {
   prices(payload: { symbol: string }): Promise<unknown>;
   exchangeInfo(payload: { symbol: string }): Promise<unknown>;
   apiRestrictions(): Promise<unknown>;
+  // The typings omit orderId, which Binance accepts and the library passes through.
+  myTrades(payload: { symbol: string; orderId: number }): Promise<unknown>;
 }
 
 export function binanceErrorCode(err: unknown): number | null {
@@ -68,6 +82,24 @@ export function isUnknownOutcome(err: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+/**
+ * Sum commissions by asset from order fills or account trades (both carry `commission` and
+ * `commissionAsset`).
+ */
+export function feesFromFills(fills: unknown[], baseAsset: string, quoteAsset: string): OrderFees {
+  const fees: OrderFees = { base: 0, quote: 0, other: {} };
+  for (const fill of fills) {
+    if (!isRecord(fill)) continue;
+    const amount = Number(fill.commission);
+    const asset = String(fill.commissionAsset ?? '');
+    if (!Number.isFinite(amount) || amount === 0) continue;
+    if (asset === baseAsset) fees.base += amount;
+    else if (asset === quoteAsset) fees.quote += amount;
+    else fees.other[asset] = (fees.other[asset] ?? 0) + amount;
+  }
+  return fees;
 }
 
 function toNumber(value: unknown, field: string): number {
@@ -211,7 +243,19 @@ export class Exchange {
       newClientOrderId: params.clientOrderId,
       newOrderRespType: 'FULL',
     });
-    return toSnapshot(res);
+    const snap = toSnapshot(res);
+    // A FULL response lists each fill with its commission; use it when it covers the execution.
+    const fills: unknown[] = Array.isArray(res.fills) ? res.fills : [];
+    if (fills.length > 0 || snap.executedQty === 0) snap.fees = feesFromFills(fills, filters.baseAsset, filters.quoteAsset);
+    return snap;
+  }
+
+  /** Actual fees charged for an order, summed from its trades. Throws if the lookup fails. */
+  async getOrderFees(filters: SymbolFilters, orderId: number): Promise<OrderFees> {
+    const trades = await this.untyped.myTrades({ symbol: filters.symbol, orderId });
+    // Only called for executed orders, so an empty list means "not visible yet", not "no fee".
+    if (!Array.isArray(trades) || trades.length === 0) throw new Error(`No trades returned for order ${orderId}`);
+    return feesFromFills(trades as unknown[], filters.baseAsset, filters.quoteAsset);
   }
 
   /** Look up an order by client id; null if the exchange has no record of it. */

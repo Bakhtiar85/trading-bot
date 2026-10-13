@@ -91,6 +91,12 @@ export interface OrderState extends GridSlotPlan {
   /** Client order id of the working order; set BEFORE the order is sent so a crash can't orphan it. */
   clientOrderId: string | null;
   orderId: number | null;
+  /**
+   * Base asset this slot actually received when its buy filled (after any fee taken in the base
+   * asset). The sell offers exactly this, rounded to the lot step. null/absent = unknown, in which
+   * case the sell assumes the estimated fee was deducted. Optional so older state files load.
+   */
+  heldQuantity?: number | null;
 }
 
 /** Bot-internal accounting of funds under management (not the whole account balance). */
