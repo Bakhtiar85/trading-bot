@@ -273,3 +273,5 @@ These are choices made where the spec was open:
 **Limitations:** no backtesting; spot only (no margin or futures); one pair per process; polling-based fill detection (a fill is noticed within one check interval).
 
 > This software trades real money when mainnet is enabled. Grid bots lose money in strong trends, and the stop-loss sells at market price, which can be worse than the trigger price in a fast move. Test thoroughly on testnet. Nothing here is financial advice.
+
+scp -r ubuntu@AB.FG.UIJ.ZZ:/home/ubuntu/trading-bot/logs/* ./misc/LOGS-XX-MMM-YYYY/
