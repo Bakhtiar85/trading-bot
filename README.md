@@ -22,8 +22,9 @@ A TypeScript grid trading bot for Binance **spot**. It buys and sells within a f
 7. [Logs and state](#logs-and-state)
 8. [Emails you will receive](#emails-you-will-receive)
 9. [After a pause or stop: resuming](#after-a-pause-or-stop-resuming)
-10. [Project structure](#project-structure)
-11. [Design decisions and assumptions](#design-decisions-and-assumptions)
+10. [Backtesting](#backtesting)
+11. [Project structure](#project-structure)
+12. [Design decisions and assumptions](#design-decisions-and-assumptions)
 
 ---
 
@@ -235,6 +236,35 @@ The old state file is archived and any of its remaining open orders are cancelle
 
 **Coins left over from a PAUSED session are not sold, and the new session does not manage them.** They stay in your account for you to handle. The new session starts from `CAPITAL_ALLOCATION_USDT` of free USDT. If you really want to restart with identical settings, stop the bot, move `data/state.json` aside, and start it again.
 
+## Backtesting
+
+Test a strategy on past prices before risking money. The backtester replays historical 1-minute BTC/USDT candles and simulates each strategy with the same fees, slippage, $5 minimum order and lot rounding as the live bot. It uses only Binance's public market data: no API key, no orders, and nothing on the VPS.
+
+```bash
+npm run backtest -- --from 2026-05-21 --to 2026-11-20 --capital 40
+npm run backtest -- --help            # all options
+```
+
+| Strategy | What it does |
+|---|---|
+| `grid` | The live bot's grid. It uses the bot's own planning and risk code, so it pauses on a breakout and keeps the coins. |
+| `grid-exit` | The same grid, but it sells everything when the price breaks *below* the range. |
+| `bos-1m` / `bos-15m` / `bos-1h` | Structure break on 1-minute, 15-minute or 1-hour candles. It buys when a candle closes above the last swing high and sells when one closes below the last swing low. A swing is a candle higher (or lower) than the `--swing` candles on each side; it's only known that many candles later, and the simulation never looks ahead. |
+| `hold` | Buy at the start and hold. This is the baseline. |
+
+**How to read the results:**
+- **Return / Final:** the result after fees.
+- **Max DD:** the worst fall from a peak.
+- **Sells / Win %:** closed positions, and the share that made money.
+- **In mkt:** the share of time spent holding BTC.
+
+Every simulated trade is saved to `data/backtests/*-trades.csv`. Downloaded candles are cached per day in `data/klines/`; the first run over 6 months downloads about 260,000 candles and takes a few minutes.
+
+**Limits of the simulation:**
+- **Fills are approximate.** Limit orders fill when a candle touches their price, and market orders fill at the next candle's open plus slippage.
+- **Fees are counted the BNB way:** they're subtracted from equity, not from the traded balances. With the stop-loss off, a strategy that trades too much can show negative equity, meaning the fees would have exceeded the capital.
+- **Past results don't predict future ones.** Don't tune settings until the past looks good; check them on a different period.
+
 ## Project structure
 
 ```
@@ -250,6 +280,7 @@ src/
   logger.ts        Winston: console + daily-rotating JSON file
   health.ts        optional GET /health endpoint, only when PORT is set
   status/          optional password-protected, read-only status + logs page
+  backtest/        historical simulator: data download/cache, strategies, report, CLI
   index.ts         entrypoint, crash + signal handlers
 ```
 
